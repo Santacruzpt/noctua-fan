@@ -1,0 +1,16 @@
+[Unit]
+Description=Noctua NF-A4x10 5V PWM fan control
+After=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/noctua-fan daemon
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=noctua-fan
+RuntimeDirectoryMode=0775
+RuntimeDirectoryPreserve=yes
+Group=gpio
+
+[Install]
+WantedBy=multi-user.target

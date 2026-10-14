@@ -1,0 +1,32 @@
+# noctua-fan configuration -> install to /etc/noctua-fan.toml
+# All keys are optional; the values shown are the defaults.
+
+# --- PWM output: GPIO18 (header pin 12) = pwmchip0 channel 0 -----------------
+pwm_chip = 0
+pwm_channel = 0
+pwm_frequency = 25000        # Hz; Noctua spec is 25 kHz
+
+# --- Tachometer: GPIO24 (header pin 18). Set to -1 if the green wire is unused
+tach_gpio = 24
+gpio_chip = 0
+pulses_per_rev = 2
+
+# --- Control loop -------------------------------------------------------------
+interval = 2.0               # seconds between temperature reads
+hysteresis = 3.0             # °C the temperature must fall before slowing down
+min_duty = 20                # lowest non-zero duty (NF-A4x10 min is ~20% / 1200 rpm)
+allow_stop = true            # curve value 0 -> fan off (false: hold at min_duty)
+kickstart_duty = 100         # brief burst when starting from a stop...
+kickstart_seconds = 1.0      # ...for this long (0 disables)
+exit_duty = 100              # duty left on the pin when the service stops (fail-safe)
+stall_seconds = 10.0         # log a warning if 0 rpm for this long while duty > 0
+thermal_zone = "/sys/class/thermal/thermal_zone0/temp"
+
+# Fan curve: [CPU temperature °C, duty %], linearly interpolated.
+curve = [
+  [40, 0],
+  [45, 20],
+  [55, 40],
+  [65, 70],
+  [75, 100],
+]
