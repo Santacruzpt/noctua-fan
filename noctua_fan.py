@@ -57,6 +57,7 @@ class Config:
     tach_gpio: int = 24
     gpio_chip: int = 0               # /dev/gpiochip<N>
     pulses_per_rev: int = 2
+    max_rpm: int = 5000              # rated max of the NF-A4x10 5V PWM; reference for rpm %
     # Control loop
     interval: float = 2.0            # seconds between temperature reads
     hysteresis: float = 3.0          # degC; speed only drops once temp falls this far
@@ -499,10 +500,32 @@ def cmd_rpm(cfg: Config, seconds: float) -> int:
     return 0
 
 
+def rpm_pct(cfg: Config, rpm: float | None) -> float | None:
+    """RPM as a percentage of the fan's rated maximum (can exceed 100: ±10 % tolerance)."""
+    if rpm is None or cfg.max_rpm <= 0:
+        return None
+    return round(100.0 * rpm / cfg.max_rpm, 1)
+
+
+def add_pct(cfg: Config, d: dict, *keys: str) -> dict:
+    """Add `<key>_pct` for each RPM field, plus `max_rpm` as the reference."""
+    for key in keys:
+        d[f"{key}_pct"] = rpm_pct(cfg, d.get(key))
+    d["max_rpm"] = cfg.max_rpm
+    return d
+
+
+def fmt_rpm(cfg: Config, rpm: float | None) -> str:
+    pct = rpm_pct(cfg, rpm)
+    if rpm is None:
+        return "n/a"
+    return f"{rpm:.0f} rpm" + ("" if pct is None else f" ({pct:.0f} % of {cfg.max_rpm} rpm max)")
+
+
 def get_status(cfg: Config) -> dict:
     rs = RunState(cfg)
     if rs.daemon_running():
-        return json.loads(rs.state.read_text())
+        return add_pct(cfg, json.loads(rs.state.read_text()), "rpm")
     st = {"mode": "daemon not running", "rpm": None}
     try:
         st["temp"] = read_temp(cfg)
@@ -512,7 +535,7 @@ def get_status(cfg: Config) -> dict:
         st["duty"] = HardwarePWM(cfg).get_duty()
     except (OSError, ValueError):
         st["duty"] = None
-    return st
+    return add_pct(cfg, st, "rpm")
 
 
 def cmd_status(cfg: Config, as_json: bool) -> int:
@@ -524,7 +547,7 @@ def cmd_status(cfg: Config, as_json: bool) -> int:
     print(f"mode : {st['mode']}")
     print(f"temp : {fmt(st.get('temp'), '{:.1f} °C')}")
     print(f"duty : {fmt(st.get('duty'), '{:.0f} %')}")
-    print(f"rpm  : {fmt(st.get('rpm'), '{:.0f}')}")
+    print(f"rpm  : {fmt_rpm(cfg, st.get('rpm'))}")
     return 0
 
 
@@ -543,15 +566,20 @@ def current_rpm(cfg: Config) -> tuple[float | None, str]:
         tach.close()
 
 
-def cmd_speed(cfg: Config, as_json: bool) -> int:
+def get_speed(cfg: Config) -> dict:
     rpm, source = current_rpm(cfg)
+    return add_pct(cfg, {"rpm": rpm, "source": source}, "rpm")
+
+
+def cmd_speed(cfg: Config, as_json: bool) -> int:
+    sp = get_speed(cfg)
     if as_json:
-        print(json.dumps({"rpm": rpm, "source": source}))
-    elif rpm is None:
+        print(json.dumps(sp))
+    elif sp["rpm"] is None:
         print("current speed: n/a (no tachometer reading)")
     else:
-        print(f"current speed: {rpm:.0f} rpm")
-    return 0 if rpm is not None else 1
+        print(f"current speed: {fmt_rpm(cfg, sp['rpm'])}")
+    return 0 if sp["rpm"] is not None else 1
 
 
 def get_stats(cfg: Config, hours: float) -> dict:
@@ -564,7 +592,7 @@ def get_stats(cfg: Config, hours: float) -> dict:
         hist.close()
     st["period_hours"] = hours
     st["rpm_current"], _ = current_rpm(cfg)
-    return st
+    return add_pct(cfg, st, "rpm_current", "rpm_avg", "rpm_max", "rpm_min")
 
 
 def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
@@ -577,11 +605,11 @@ def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
     when = lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
     period = f"{hours:g} h"
     print(f"Fan speed, last {period}")
-    print(f"  current : {fmt(st['rpm_current'], '{:.0f} rpm')}")
-    print(f"  average : {fmt(st['rpm_avg'], '{:.0f} rpm')}")
-    print(f"  maximum : {fmt(st['rpm_max'], '{:.0f} rpm')}"
-          + (f"  (at {when(st['max_time'])})" if st["max_time"] else ""))
-    print(f"  minimum : {fmt(st['rpm_min'], '{:.0f} rpm')}")
+    print(f"  current : {fmt_rpm(cfg, st['rpm_current'])}")
+    print(f"  average : {fmt_rpm(cfg, st['rpm_avg'])}")
+    print(f"  maximum : {fmt_rpm(cfg, st['rpm_max'])}"
+          + (f"  at {when(st['max_time'])}" if st["max_time"] else ""))
+    print(f"  minimum : {fmt_rpm(cfg, st['rpm_min'])}")
     print(f"  avg duty: {fmt(st['duty_avg'], '{:.0f} %')}")
     print(f"  avg temp: {fmt(st['temp_avg'], '{:.1f} °C')}"
           f"   (max {fmt(st['temp_max'], '{:.1f} °C')})")
@@ -653,8 +681,7 @@ def make_handler(cfg: Config, token: str):
                 elif url.path == "/status":
                     self.reply(200, get_status(cfg))
                 elif url.path == "/speed":
-                    rpm, source = current_rpm(cfg)
-                    self.reply(200, {"rpm": rpm, "source": source})
+                    self.reply(200, get_speed(cfg))
                 elif url.path == "/stats":
                     self.reply(200, get_stats(cfg, float(q.get("hours", ["24"])[0])))
                 else:

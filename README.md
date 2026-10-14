@@ -75,10 +75,10 @@ Example `stats` output:
 
 ```
 Fan speed, last 24 h
-  current : 1840 rpm
-  average : 1712 rpm
-  maximum : 3655 rpm  (at 2026-10-15 14:02)
-  minimum : 1190 rpm
+  current : 1840 rpm (37 % of 5000 rpm max)
+  average : 1712 rpm (34 % of 5000 rpm max)
+  maximum : 3655 rpm (73 % of 5000 rpm max)  at 2026-10-15 14:02
+  minimum : 1190 rpm (24 % of 5000 rpm max)
   avg duty: 31 %
   avg temp: 51.4 °C   (max 63.0 °C)
   data    : 1440 samples since 2026-10-14 15:30, 24.0 h covered
@@ -96,6 +96,11 @@ the SD card. Rows older than `history_days` (default 7) are deleted.
 - **average** is time-weighted over the period.
 - **maximum** is the highest 2-second reading.
 - **minimum** is the lowest 2-second reading. It is 0 if the fan was stopped.
+
+Every speed is also shown as a percentage of `max_rpm`, the fan's rated
+maximum (5000 rpm for the NF-A4x10 5V PWM). Fans have a ±10 % tolerance, so
+readings slightly above 100 % are normal. The JSON output and the API include
+the matching `*_pct` fields and `max_rpm`.
 
 If the service has run for less than the requested period, `stats` says so.
 
@@ -118,6 +123,8 @@ Main settings:
 - `kickstart_*`: a short full-speed burst when the fan starts from a stop.
 - `exit_duty`: the duty left on the pin when the service stops. The default is
   100 % so the Pi stays safe.
+- `max_rpm`: the rated maximum speed that percentages are based on (default
+  5000). Set it to 0 to hide percentages.
 - `tach_gpio = -1`: turns RPM readout off if the green wire isn't connected.
   Speed statistics then show n/a, but duty and temperature are still recorded.
 - `history_interval` and `history_days`: the speed-history granularity and how
@@ -165,6 +172,11 @@ ask it to.
    - `api_token`: the output of `sudo cat /etc/noctua-fan/api-token` on the
      Pi. Leave it empty for read-only.
 4. Enable the tool for a model or in a chat.
+
+Answers give every speed both in rpm and as a percentage of the fan's
+maximum, for example "3660 rpm (73% of max)". The tool's output starts with an
+instruction to do so, because small models otherwise tend to drop the
+percentage.
 
 The tool provides four functions: `get_fan_status`,
 `get_fan_speed_stats(hours=24)`, `set_fan_speed(percent)` and

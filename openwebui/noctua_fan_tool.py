@@ -18,6 +18,23 @@ def _fmt(value, fmt, unit=""):
     return "unknown" if value is None else f"{format(value, fmt)}{unit}"
 
 
+def _rpm(st, key):
+    """'1850 rpm = 37% of max speed' from an API response's <key> and <key>_pct fields."""
+    rpm, pct = st.get(key), st.get(f"{key}_pct")
+    if rpm is None:
+        return "unknown"
+    return f"{rpm:.0f} rpm" + ("" if pct is None else f" = {pct:.0f}% of max speed")
+
+
+def _answer_rule(st):
+    """Leading instruction: small models drop percentages unless told up front."""
+    if not st.get("max_rpm"):
+        return ""
+    return (f"IMPORTANT: in your answer, state every fan speed as BOTH the rpm value AND "
+            f"its percentage of the fan's {st['max_rpm']} rpm maximum, "
+            f"e.g. '2450 rpm (49% of max)'.\n")
+
+
 class Tools:
     class Valves(BaseModel):
         api_url: str = Field(
@@ -60,7 +77,8 @@ class Tools:
 
     def get_fan_status(self) -> str:
         """
-        Get the Raspberry Pi fan's current state: fan speed in RPM, CPU temperature,
+        Get the Raspberry Pi fan's current state: fan speed in RPM and as a percentage
+        of the fan's maximum speed, CPU temperature,
         PWM duty cycle and whether it is under automatic (temperature) or manual control.
         Use this for questions like "how fast is the fan spinning?" or "how hot is the Pi?".
         """
@@ -69,8 +87,9 @@ class Tools:
         except RuntimeError as e:
             return str(e)
         return (
-            "Raspberry Pi fan right now:\n"
-            f"- speed: {_fmt(st.get('rpm'), '.0f', ' rpm')}\n"
+            _answer_rule(st)
+            + "Raspberry Pi fan right now:\n"
+            f"- speed: {_rpm(st, 'rpm')}\n"
             f"- CPU temperature: {_fmt(st.get('temp'), '.1f', ' °C')}\n"
             f"- duty cycle: {_fmt(st.get('duty'), '.0f', ' %')}\n"
             f"- control mode: {st.get('mode', 'unknown')}"
@@ -78,8 +97,9 @@ class Tools:
 
     def get_fan_speed_stats(self, hours: float = 24) -> str:
         """
-        Get fan speed statistics over a past period: current, average, maximum and
-        minimum RPM, plus average duty cycle and CPU temperature.
+        Get fan speed statistics over a past period: current, average, highest and
+        lowest speed, each in RPM and as a percentage of the fan's maximum speed,
+        plus average duty cycle and CPU temperature.
         Use this for questions about the fan over time, e.g. "what was the max fan speed today?"
         or "average fan speed in the last 6 hours".
         :param hours: Length of the period in hours, counting back from now. Default 24.
@@ -92,11 +112,11 @@ class Tools:
             return f"No fan history recorded in the last {hours:g} hours."
         covered = (st.get("covered_seconds") or 0) / 3600
         lines = [
-            f"Raspberry Pi fan speed, last {hours:g} hours:",
-            f"- current: {_fmt(st.get('rpm_current'), '.0f', ' rpm')}",
-            f"- average: {_fmt(st.get('rpm_avg'), '.0f', ' rpm')}",
-            f"- maximum: {_fmt(st.get('rpm_max'), '.0f', ' rpm')}",
-            f"- minimum: {_fmt(st.get('rpm_min'), '.0f', ' rpm')}",
+            _answer_rule(st) + f"Raspberry Pi fan speed, last {hours:g} hours:",
+            f"- current: {_rpm(st, 'rpm_current')}",
+            f"- average: {_rpm(st, 'rpm_avg')}",
+            f"- highest: {_rpm(st, 'rpm_max')}",
+            f"- lowest: {_rpm(st, 'rpm_min')}",
             f"- average duty cycle: {_fmt(st.get('duty_avg'), '.0f', ' %')}",
             f"- average CPU temperature: {_fmt(st.get('temp_avg'), '.1f', ' °C')} "
             f"(highest {_fmt(st.get('temp_max'), '.1f', ' °C')})",

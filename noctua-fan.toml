@@ -10,6 +10,7 @@ pwm_frequency = 25000        # Hz; Noctua spec is 25 kHz
 tach_gpio = 24
 gpio_chip = 0
 pulses_per_rev = 2
+max_rpm = 5000               # rated max speed (NF-A4x10 5V PWM); speeds are also shown as % of this
 
 # --- Control loop -------------------------------------------------------------
 interval = 2.0               # seconds between temperature reads

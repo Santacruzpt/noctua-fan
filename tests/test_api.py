@@ -101,7 +101,9 @@ class ReadEndpointTests(APITestBase):
         self.fake_daemon()
         code, st = self.call("GET", "/status")
         self.assertEqual((code, st["rpm"], st["mode"]), (200, 1850.0, "auto"))
-        self.assertEqual(self.call("GET", "/speed"), (200, {"rpm": 1850.0, "source": "daemon"}))
+        self.assertEqual(self.call("GET", "/speed"), (200, {"rpm": 1850.0, "source": "daemon",
+                                                         "rpm_pct": 37.0, "max_rpm": 5000}))
+        self.assertEqual((st["rpm_pct"], st["max_rpm"]), (37.0, 5000))
 
     def test_status_without_daemon(self):
         code, st = self.call("GET", "/status")
@@ -113,6 +115,9 @@ class ReadEndpointTests(APITestBase):
         self.assertEqual(code, 200)
         self.assertAlmostEqual(st["rpm_avg"], 2000)
         self.assertEqual((st["rpm_max"], st["rpm_min"], st["samples"]), (3600, 900, 3))
+        self.assertEqual((st["rpm_avg_pct"], st["rpm_max_pct"], st["rpm_min_pct"], st["max_rpm"]),
+                         (40.0, 72.0, 18.0, 5000))
+        self.assertIsNone(st["rpm_current_pct"])                  # no daemon, no tach
         code, st = self.call("GET", "/stats?hours=5")
         self.assertEqual((st["rpm_max"], st["samples"]), (1200, 1))
 
@@ -164,6 +169,20 @@ class ReadOnlyServerTests(APITestBase):
         self.assertIn("disabled", r["error"])
 
 
+class RpmPercentTests(unittest.TestCase):
+    def test_pct_and_format(self):
+        cfg = nf.Config()
+        self.assertEqual(nf.rpm_pct(cfg, 2500), 50.0)
+        self.assertEqual(nf.rpm_pct(cfg, 5300), 106.0)            # within ±10 % tolerance
+        self.assertIsNone(nf.rpm_pct(cfg, None))
+        self.assertEqual(nf.fmt_rpm(cfg, 1850), "1850 rpm (37 % of 5000 rpm max)")
+        self.assertEqual(nf.fmt_rpm(cfg, None), "n/a")
+        cfg.max_rpm = 4500
+        self.assertEqual(nf.rpm_pct(cfg, 4500), 100.0)
+        cfg.max_rpm = 0                                           # disables percentages
+        self.assertEqual(nf.fmt_rpm(cfg, 1850), "1850 rpm")
+
+
 class DaemonRunningTests(unittest.TestCase):
     def test_root_owned_daemon_counts_as_running(self):
         with tempfile.TemporaryDirectory() as d:
@@ -186,16 +205,18 @@ class OpenWebUIToolTests(APITestBase):
     def test_status(self):
         self.fake_daemon()
         out = self.tool.get_fan_status()
-        self.assertIn("speed: 1850 rpm", out)
+        self.assertIn("speed: 1850 rpm = 37% of max speed", out)
         self.assertIn("CPU temperature: 52.0 °C", out)
         self.assertIn("control mode: auto", out)
 
     def test_stats(self):
         self.fill_history()
         out = self.tool.get_fan_speed_stats()
-        self.assertIn("average: 2000 rpm", out)
-        self.assertIn("maximum: 3600 rpm", out)
-        self.assertIn("minimum: 900 rpm", out)
+        self.assertIn("average: 2000 rpm = 40% of max speed", out)
+        self.assertIn("highest: 3600 rpm = 72% of max speed", out)
+        self.assertIn("lowest: 900 rpm = 18% of max speed", out)
+        self.assertTrue(out.startswith("IMPORTANT:"))
+        self.assertIn("5000 rpm maximum", out)
         self.assertIn("last 24 hours", out)
         self.assertIn("1200 rpm", self.tool.get_fan_speed_stats(hours=5))
 
