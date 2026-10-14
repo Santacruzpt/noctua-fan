@@ -41,10 +41,9 @@ Noctua's 4-pin connector → Pi 40-pin header (no extra components needed):
 ## Install (on the Pi)
 
 ```sh
-scp -r noctua-fan pi@raspberrypi:   # from your PC
-ssh pi@raspberrypi
-cd noctua-fan && sudo ./install.sh
-sudo reboot                         # only needed the first time (enables the PWM overlay)
+git clone https://github.com/Santacruzpt/noctua-fan.git
+cd noctua-fan && sudo ./install.sh          # add --api for the HTTP API / Open WebUI
+sudo reboot                                 # only needed the first time (enables the PWM overlay)
 ```
 
 `install.sh` does the following:
@@ -52,6 +51,8 @@ sudo reboot                         # only needed the first time (enables the PW
 - copies the app to `/usr/local/bin/noctua-fan` and the config to `/etc/noctua-fan.toml`
 - adds `dtoverlay=pwm,pin=18,func=2` to `/boot/firmware/config.txt`
 - enables the `noctua-fan` systemd service
+- with `--api`, it also enables the `noctua-fan-api` service and generates
+  an API token (see [Open WebUI](#open-webui))
 
 ## Usage
 
@@ -121,11 +122,63 @@ Main settings:
   Speed statistics then show n/a, but duty and temperature are still recorded.
 - `history_interval` and `history_days`: the speed-history granularity and how
   long it is kept.
+- `api_bind`, `api_port` and `api_token_file`: settings for the HTTP API (see below).
+
+## HTTP API
+
+`noctua-fan serve` runs a small JSON API, by default on port 9102. Install it
+with `sudo ./install.sh --api`. The `noctua-fan-api` service runs as an
+unprivileged dynamic user in the `gpio` group, separate from the fan daemon.
+
+| Endpoint | Description |
+|---|---|
+| `GET /status` | temperature, duty, rpm and control mode |
+| `GET /speed` | current rpm |
+| `GET /stats?hours=24` | current, average, max and min rpm, plus average duty and temperature |
+| `POST /set` `{"percent": 60}` | manual duty override (**token required**) |
+| `POST /auto` | return to temperature control (**token required**) |
+
+```sh
+curl http://raspberrypi.local:9102/stats?hours=6
+curl -X POST -H "Authorization: Bearer $(sudo cat /etc/noctua-fan/api-token)" \
+     -d '{"percent": 60}' http://raspberrypi.local:9102/set
+```
+
+Read endpoints are open to anyone who can reach the port. Fan control is
+enabled only when `/etc/noctua-fan/api-token` exists; without it the API is
+read-only. To restrict the API to the Pi itself, set
+`api_bind = "127.0.0.1"`.
+
+## Open WebUI
+
+[`openwebui/noctua_fan_tool.py`](openwebui/noctua_fan_tool.py) is an
+[Open WebUI](https://openwebui.com) tool that talks to the HTTP API. With it,
+a model can answer questions like "how fast is the Pi fan spinning?" or "what
+was the max fan speed in the last 24 hours?", and can set the speed when you
+ask it to.
+
+1. On the Pi, run `sudo ./install.sh --api`.
+2. In Open WebUI, go to **Workspace → Tools → +**, paste the file's contents
+   and save.
+3. Open the tool's **Valves** and set the following:
+   - `api_url`: `http://<pi-hostname-or-ip>:9102`
+   - `api_token`: the output of `sudo cat /etc/noctua-fan/api-token` on the
+     Pi. Leave it empty for read-only.
+4. Enable the tool for a model or in a chat.
+
+The tool provides four functions: `get_fan_status`,
+`get_fan_speed_stats(hours=24)`, `set_fan_speed(percent)` and
+`set_fan_automatic`.
+
+Open WebUI runs tools on its own server, so that server must be able to reach
+the Pi on port 9102. When you call the Open WebUI API (rather than using the
+browser), pass `"params": {"function_calling": "legacy"}` so the tools are
+actually executed.
 
 ## Development
 
 ```sh
-python3 -m unittest -v tests/test_noctua_fan.py
+python3 -m unittest discover -s tests
 ```
 
 The tests run on any Linux machine against a fake sysfs PWM/thermal tree.

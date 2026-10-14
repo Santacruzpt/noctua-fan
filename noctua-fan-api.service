@@ -1,0 +1,22 @@
+[Unit]
+Description=Noctua fan HTTP API (for Open WebUI and other clients)
+After=network.target noctua-fan.service
+Wants=noctua-fan.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/noctua-fan serve
+Restart=on-failure
+RestartSec=5
+# Unprivileged: group gpio gives access to the PWM sysfs nodes, the token
+# file and the daemon's override file in /run/noctua-fan.
+DynamicUser=yes
+SupplementaryGroups=gpio
+ReadWritePaths=-/run/noctua-fan
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

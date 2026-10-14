@@ -15,6 +15,7 @@ Commands (run `noctua-fan` with no arguments to list them with their options):
   noctua-fan auto          clear manual override (daemon follows the curve again)
   noctua-fan rpm           measure RPM directly from the tach line
   noctua-fan daemon        run the temperature-controlled loop (used by systemd)
+  noctua-fan serve         HTTP JSON API for remote clients (e.g. Open WebUI)
 
 Stdlib only (Python >= 3.11); python3-lgpio is needed only for RPM readout.
 """
@@ -22,6 +23,7 @@ Stdlib only (Python >= 3.11); python3-lgpio is needed only for RPM readout.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -31,6 +33,8 @@ import sys
 import threading
 import time
 import tomllib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,6 +78,10 @@ class Config:
     history_db: str = "/var/lib/noctua-fan/history.db"
     history_interval: float = 60.0   # seconds aggregated into one stored sample
     history_days: float = 7.0        # samples older than this are deleted
+    # HTTP API (`noctua-fan serve`)
+    api_bind: str = "0.0.0.0"
+    api_port: int = 9102
+    api_token_file: str = "/etc/noctua-fan/api-token"  # empty/missing -> read-only API
 
     @classmethod
     def load(cls, path: str | None) -> "Config":
@@ -275,6 +283,8 @@ class RunState:
             pid = json.loads(self.state.read_text())["pid"]
             os.kill(pid, 0)
             return True
+        except PermissionError:
+            return True  # exists, but owned by root (we're a gpio-group user)
         except (OSError, ValueError, KeyError):
             return False
 
@@ -438,29 +448,41 @@ def cmd_daemon(cfg: Config, stop: threading.Event | None = None) -> int:
     return 0
 
 
-def cmd_set(cfg: Config, percent: float) -> int:
+def set_duty(cfg: Config, percent: float) -> dict:
     percent = clamp(percent)
     rs = RunState(cfg)
     if rs.daemon_running():
         rs.override.write_text(f"{percent}\n")
-        print(f"manual override: {percent:.0f}% (run 'noctua-fan auto' to resume the curve)")
-    else:
-        pwm = HardwarePWM(cfg)
-        pwm.open()
-        pwm.set_duty(percent)
-        print(f"duty set to {percent:.0f}%")
+        return {"duty": percent, "mode": "manual",
+                "message": f"manual override: {percent:.0f}% (run 'noctua-fan auto' "
+                           "to resume the curve)"}
+    pwm = HardwarePWM(cfg)
+    pwm.open()
+    pwm.set_duty(percent)
+    return {"duty": percent, "mode": "daemon not running",
+            "message": f"duty set to {percent:.0f}%"}
+
+
+def set_auto(cfg: Config) -> dict:
+    rs = RunState(cfg)
+    try:
+        rs.override.unlink()
+        msg = "manual override cleared; following the temperature curve"
+    except FileNotFoundError:
+        msg = "no manual override was set; already following the temperature curve"
+    running = rs.daemon_running()
+    if not running:
+        msg += " (note: the daemon is not running - systemctl start noctua-fan)"
+    return {"mode": "auto" if running else "daemon not running", "message": msg}
+
+
+def cmd_set(cfg: Config, percent: float) -> int:
+    print(set_duty(cfg, percent)["message"])
     return 0
 
 
 def cmd_auto(cfg: Config) -> int:
-    rs = RunState(cfg)
-    try:
-        rs.override.unlink()
-        print("manual override cleared; following the temperature curve")
-    except FileNotFoundError:
-        print("no manual override was set")
-    if not rs.daemon_running():
-        print("note: the daemon is not running (systemctl start noctua-fan)")
+    print(set_auto(cfg)["message"])
     return 0
 
 
@@ -477,20 +499,24 @@ def cmd_rpm(cfg: Config, seconds: float) -> int:
     return 0
 
 
-def cmd_status(cfg: Config, as_json: bool) -> int:
+def get_status(cfg: Config) -> dict:
     rs = RunState(cfg)
     if rs.daemon_running():
-        st = json.loads(rs.state.read_text())
-    else:
-        st = {"mode": "daemon not running", "rpm": None}
-        try:
-            st["temp"] = read_temp(cfg)
-        except OSError:
-            st["temp"] = None
-        try:
-            st["duty"] = HardwarePWM(cfg).get_duty()
-        except (OSError, ValueError):
-            st["duty"] = None
+        return json.loads(rs.state.read_text())
+    st = {"mode": "daemon not running", "rpm": None}
+    try:
+        st["temp"] = read_temp(cfg)
+    except OSError:
+        st["temp"] = None
+    try:
+        st["duty"] = HardwarePWM(cfg).get_duty()
+    except (OSError, ValueError):
+        st["duty"] = None
+    return st
+
+
+def cmd_status(cfg: Config, as_json: bool) -> int:
+    st = get_status(cfg)
     if as_json:
         print(json.dumps(st))
         return 0
@@ -528,9 +554,9 @@ def cmd_speed(cfg: Config, as_json: bool) -> int:
     return 0 if rpm is not None else 1
 
 
-def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
-    if hours <= 0:
-        raise ValueError("--hours must be positive")
+def get_stats(cfg: Config, hours: float) -> dict:
+    if not 0 < hours <= 24 * 366:
+        raise ValueError("hours must be between 0 and 8784")
     hist = History(cfg, readonly=True)
     try:
         st = hist.stats(hours)
@@ -538,6 +564,11 @@ def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
         hist.close()
     st["period_hours"] = hours
     st["rpm_current"], _ = current_rpm(cfg)
+    return st
+
+
+def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
+    st = get_stats(cfg, hours)
     if as_json:
         print(json.dumps(st))
         return 0
@@ -564,6 +595,126 @@ def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# HTTP API
+# --------------------------------------------------------------------------- #
+
+def load_token(cfg: Config) -> str:
+    if not cfg.api_token_file:
+        return ""
+    try:
+        return Path(cfg.api_token_file).read_text().strip()
+    except FileNotFoundError:
+        return ""
+
+
+API_HELP = {
+    "GET /status": "temperature, duty, rpm and control mode",
+    "GET /speed": "current fan speed in rpm",
+    "GET /stats?hours=24": "current/avg/max/min rpm, avg duty and temp over a period",
+    "POST /set {\"percent\": 0-100}": "manual duty override (needs Bearer token)",
+    "POST /auto": "return to temperature control (needs Bearer token)",
+}
+
+
+def make_handler(cfg: Config, token: str):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "noctua-fan"
+
+        def log_message(self, fmt, *args):
+            log.debug("%s %s", self.address_string(), fmt % args)
+
+        def reply(self, code: int, body: dict) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def handle_errors(self, fn) -> None:
+            try:
+                fn()
+            except (ValueError, KeyError, TypeError) as e:
+                self.reply(400, {"error": str(e)})
+            except FileNotFoundError as e:
+                self.reply(503, {"error": str(e)})
+            except Exception as e:  # never kill the server thread
+                log.exception("API error")
+                self.reply(500, {"error": f"{type(e).__name__}: {e}"})
+
+        def do_GET(self) -> None:
+            url = urlparse(self.path)
+            q = parse_qs(url.query)
+
+            def run():
+                if url.path in ("/", "/help"):
+                    self.reply(200, {"endpoints": API_HELP, "control_enabled": bool(token)})
+                elif url.path == "/status":
+                    self.reply(200, get_status(cfg))
+                elif url.path == "/speed":
+                    rpm, source = current_rpm(cfg)
+                    self.reply(200, {"rpm": rpm, "source": source})
+                elif url.path == "/stats":
+                    self.reply(200, get_stats(cfg, float(q.get("hours", ["24"])[0])))
+                else:
+                    self.reply(404, {"error": "not found", "endpoints": API_HELP})
+            self.handle_errors(run)
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            if path not in ("/set", "/auto"):
+                self.reply(404, {"error": "not found", "endpoints": API_HELP})
+                return
+            if not token:
+                self.reply(403, {"error": "fan control over the API is disabled "
+                                          f"(no token in {cfg.api_token_file})"})
+                return
+            auth = self.headers.get("Authorization", "")
+            if not hmac.compare_digest(auth.encode(), f"Bearer {token}".encode()):
+                self.reply(401, {"error": "missing or wrong Bearer token"})
+                return
+
+            def run():
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 1024:
+                    raise ValueError("request body too large")
+                body = json.loads(self.rfile.read(length)) if length else {}
+                if path == "/set":
+                    percent = float(body["percent"])
+                    if not 0 <= percent <= 100:
+                        raise ValueError("percent must be between 0 and 100")
+                    result = set_duty(cfg, percent)
+                else:
+                    result = set_auto(cfg)
+                log.info("API %s from %s: %s", path, self.address_string(), result["message"])
+                self.reply(200, result)
+            self.handle_errors(run)
+
+    return Handler
+
+
+def make_server(cfg: Config) -> ThreadingHTTPServer:
+    token = load_token(cfg)
+    server = ThreadingHTTPServer((cfg.api_bind, cfg.api_port), make_handler(cfg, token))
+    server.daemon_threads = True
+    log.info("API listening on %s:%d (fan control %s)", cfg.api_bind,
+             server.server_address[1], "enabled" if token else "disabled: read-only")
+    return server
+
+
+def cmd_serve(cfg: Config) -> int:
+    server = make_server(cfg)
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="noctua-fan",
@@ -577,6 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
   noctua-fan stats --json        machine-readable output
   noctua-fan set 60              run the fan at 60 %
   noctua-fan auto                return to temperature control
+  noctua-fan serve               start the HTTP API (port 9102)
   noctua-fan help stats          options of one command""")
     ap.add_argument("-c", "--config", help=f"config file (default {DEFAULT_CONFIG_PATH})")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -596,6 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-s", "--seconds", type=float, default=3.0,
                    help="measurement window (default 3)")
     sub.add_parser("daemon", help="run the temperature control loop (systemd)")
+    sub.add_parser("serve", help="HTTP JSON API for remote clients such as Open WebUI")
     p = sub.add_parser("help", help="show these options, or a command's options")
     p.add_argument("topic", nargs="?", help="command name")
     return ap
@@ -629,11 +782,13 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(cfg, args.json)
         if args.cmd == "rpm":
             return cmd_rpm(cfg, args.seconds)
+        if args.cmd == "serve":
+            return cmd_serve(cfg)
         return cmd_daemon(cfg)
     except PermissionError as e:
         print(f"permission denied: {e.filename} (run with sudo or add your user "
               "to the 'gpio' group)", file=sys.stderr)
-    except (RuntimeError, ValueError, FileNotFoundError, sqlite3.Error) as e:
+    except (RuntimeError, ValueError, OSError, sqlite3.Error) as e:
         print(f"error: {e}", file=sys.stderr)
     return 1
 
