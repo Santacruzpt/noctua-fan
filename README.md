@@ -32,8 +32,11 @@ Noctua's 4-pin connector → Pi 40-pin header (no extra components needed):
 * The fan draws about 50 mA, well within what the 5 V rail can supply.
 * Fail-safe: if the PWM line floats (Pi off, service not running), the fan's
   internal pull-up makes it run at **full speed**.
-* Hardware PWM0 on GPIO18 is shared with the 3.5 mm analog audio jack. Don't
-  use analog audio at the same time. HDMI audio is unaffected.
+* The 3.5 mm audio jack is unaffected. On the Pi 4 it runs on the second PWM
+  controller (`pwm1`, internal GPIO40/41), while GPIO18 uses the first
+  controller (`pwm`). The overlay README's "analogue audio uses both PWM
+  channels" note only applies to Pi 3 and older, which have a single PWM
+  controller.
 
 ## Install (on the Pi)
 
