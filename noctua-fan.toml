@@ -22,6 +22,11 @@ exit_duty = 100              # duty left on the pin when the service stops (fail
 stall_seconds = 10.0         # log a warning if 0 rpm for this long while duty > 0
 thermal_zone = "/sys/class/thermal/thermal_zone0/temp"
 
+# --- Speed history (used by `noctua-fan stats`) -------------------------------
+history_db = "/var/lib/noctua-fan/history.db"
+history_interval = 60.0      # seconds averaged into one stored sample
+history_days = 7.0           # how long samples are kept
+
 # Fan curve: [CPU temperature °C, duty %], linearly interpolated.
 curve = [
   [40, 0],

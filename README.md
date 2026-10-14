@@ -52,13 +52,48 @@ sudo reboot                         # only needed the first time (enables the PW
 
 ## Usage
 
+Run `noctua-fan` with no arguments (or `noctua-fan help`) to list every
+command and option. Use `noctua-fan help <command>` for one command's options.
+
 ```sh
-noctua-fan status          # temp, duty, rpm, mode
-noctua-fan set 60          # manual 60 % (overrides the curve while the service runs)
-noctua-fan auto            # back to the temperature curve
-noctua-fan rpm             # measure RPM (only when the service isn't running)
+noctua-fan speed               # current fan speed (rpm)
+noctua-fan stats               # current / average / max / min speed, last 24 h
+noctua-fan stats --hours 6     # same, for any period (up to history_days)
+noctua-fan stats --json        # machine-readable output
+noctua-fan status              # temp, duty, rpm, mode
+noctua-fan set 60              # manual 60 % (overrides the curve while the service runs)
+noctua-fan auto                # back to the temperature curve
+noctua-fan rpm                 # raw tach measurement (only when the service isn't running)
 journalctl -u noctua-fan -f
 ```
+
+Example `stats` output:
+
+```
+Fan speed, last 24 h
+  current : 1840 rpm
+  average : 1712 rpm
+  maximum : 3655 rpm  (at 2026-10-15 14:02)
+  minimum : 1190 rpm
+  avg duty: 31 %
+  avg temp: 51.4 °C   (max 63.0 °C)
+  data    : 1440 samples since 2026-10-14 15:30, 24.0 h covered
+```
+
+### How the speed history works
+
+The service measures RPM every `interval` seconds (default 2). Each minute
+(`history_interval`) it stores one row in `/var/lib/noctua-fan/history.db`
+(SQLite) with that minute's average, maximum and minimum RPM, plus the average
+duty and temperature. That's about 1,440 small writes a day, which is gentle on
+the SD card. Rows older than `history_days` (default 7) are deleted.
+
+`stats` reports the following:
+- **average** is time-weighted over the period.
+- **maximum** is the highest 2-second reading.
+- **minimum** is the lowest 2-second reading. It is 0 if the fan was stopped.
+
+If the service has run for less than the requested period, `stats` says so.
 
 Users in the `gpio` group (the default `pi` user is) can run these commands
 without sudo.
@@ -80,6 +115,9 @@ Main settings:
 - `exit_duty`: the duty left on the pin when the service stops. The default is
   100 % so the Pi stays safe.
 - `tach_gpio = -1`: turns RPM readout off if the green wire isn't connected.
+  Speed statistics then show n/a, but duty and temperature are still recorded.
+- `history_interval` and `history_days`: the speed-history granularity and how
+  long it is kept.
 
 ## Development
 

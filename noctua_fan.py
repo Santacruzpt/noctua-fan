@@ -7,11 +7,13 @@ PWM  : hardware PWM via the kernel sysfs interface (dtoverlay=pwm), 25 kHz as
 Tach : open-collector output, 2 pulses per revolution, read with lgpio edge
        alerts using the Pi's internal pull-up. Default GPIO24 (pin 18). Optional.
 
-Commands:
+Commands (run `noctua-fan` with no arguments to list them with their options):
+  noctua-fan speed         current fan speed (RPM)
+  noctua-fan stats         current, min, max and average speed over a period (default 24 h)
+  noctua-fan status        temperature, duty, RPM and mode
   noctua-fan set <0-100>   set duty cycle (manual override if daemon is running)
   noctua-fan auto          clear manual override (daemon follows the curve again)
-  noctua-fan status        print temperature, duty and RPM
-  noctua-fan rpm           measure RPM for a few seconds
+  noctua-fan rpm           measure RPM directly from the tach line
   noctua-fan daemon        run the temperature-controlled loop (used by systemd)
 
 Stdlib only (Python >= 3.11); python3-lgpio is needed only for RPM readout.
@@ -24,6 +26,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -67,6 +70,10 @@ class Config:
     # Paths (overridable for testing)
     pwm_root: str = "/sys/class/pwm"
     run_dir: str = "/run/noctua-fan"
+    # Speed history (for `stats`)
+    history_db: str = "/var/lib/noctua-fan/history.db"
+    history_interval: float = 60.0   # seconds aggregated into one stored sample
+    history_days: float = 7.0        # samples older than this are deleted
 
     @classmethod
     def load(cls, path: str | None) -> "Config":
@@ -283,6 +290,83 @@ class RunState:
             return None
 
 
+class History:
+    """Per-interval speed samples in SQLite: avg/max/min RPM, avg duty and temp."""
+
+    SCHEMA = """CREATE TABLE IF NOT EXISTS samples (
+        ts REAL PRIMARY KEY,      -- unix time at the end of the interval
+        seconds REAL NOT NULL,    -- length of the interval
+        rpm_avg REAL, rpm_max REAL, rpm_min REAL,   -- NULL if no tachometer
+        duty_avg REAL NOT NULL,
+        temp_avg REAL NOT NULL)"""
+
+    def __init__(self, cfg: Config, readonly: bool = False):
+        self.cfg = cfg
+        path = Path(cfg.history_db)
+        if readonly:
+            if not path.exists():
+                raise FileNotFoundError(f"no speed history yet ({path}); is the daemon running?")
+            self.db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(path)
+            self.db.execute(self.SCHEMA)
+            self.db.commit()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.start = time.time()
+        self.rpms: list[float] = []
+        self.duties: list[float] = []
+        self.temps: list[float] = []
+
+    def add(self, rpm: float | None, duty: float, temp: float) -> None:
+        if rpm is not None:
+            self.rpms.append(rpm)
+        self.duties.append(duty)
+        self.temps.append(temp)
+        if time.time() - self.start >= self.cfg.history_interval:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.duties:
+            return
+        now = time.time()
+        r = self.rpms
+        self.db.execute(
+            "INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?)",
+            (now, now - self.start,
+             sum(r) / len(r) if r else None, max(r) if r else None, min(r) if r else None,
+             sum(self.duties) / len(self.duties), sum(self.temps) / len(self.temps)))
+        self.db.execute("DELETE FROM samples WHERE ts < ?",
+                        (now - self.cfg.history_days * 86400,))
+        self.db.commit()
+        self._reset()
+
+    def stats(self, hours: float) -> dict:
+        since = time.time() - hours * 3600
+        row = self.db.execute(
+            """SELECT COUNT(*), SUM(seconds), MIN(ts - seconds),
+                      SUM(rpm_avg * seconds) / SUM(CASE WHEN rpm_avg IS NOT NULL
+                                                        THEN seconds END),
+                      MAX(rpm_max), MIN(rpm_min),
+                      SUM(duty_avg * seconds) / SUM(seconds),
+                      SUM(temp_avg * seconds) / SUM(seconds), MAX(temp_avg)
+               FROM samples WHERE ts >= ?""", (since,)).fetchone()
+        keys = ("samples", "covered_seconds", "first_sample", "rpm_avg", "rpm_max",
+                "rpm_min", "duty_avg", "temp_avg", "temp_max")
+        st = dict(zip(keys, row))
+        st["max_time"] = None
+        if st["rpm_max"] is not None:
+            st["max_time"] = self.db.execute(
+                "SELECT ts FROM samples WHERE ts >= ? AND rpm_max = ? ORDER BY ts DESC LIMIT 1",
+                (since, st["rpm_max"])).fetchone()[0]
+        return st
+
+    def close(self) -> None:
+        self.db.close()
+
+
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
@@ -295,6 +379,7 @@ def cmd_daemon(cfg: Config, stop: threading.Event | None = None) -> int:
     ctl = Controller(cfg)
     rs = RunState(cfg)
     rs.dir.mkdir(parents=True, exist_ok=True)
+    hist = History(cfg)
 
     if stop is None:
         stop = threading.Event()
@@ -337,12 +422,15 @@ def cmd_daemon(cfg: Config, stop: threading.Event | None = None) -> int:
             else:
                 zero_rpm_since = None
 
+            hist.add(rpm, duty, temp)
             rs.write_state(pid=os.getpid(), time=time.time(), temp=temp,
                            duty=duty, rpm=rpm, mode="manual" if override is not None else "auto")
     finally:
         log.info("exiting, leaving fan at %d%%", cfg.exit_duty)
         pwm.set_duty(cfg.exit_duty)
         tach.close()
+        hist.flush()
+        hist.close()
         try:
             rs.state.unlink()
         except OSError:
@@ -414,25 +502,125 @@ def cmd_status(cfg: Config, as_json: bool) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="noctua-fan", description=__doc__.split("\n\n")[0])
+def current_rpm(cfg: Config) -> tuple[float | None, str]:
+    """Latest RPM from the daemon, or a direct 2 s measurement if it isn't running."""
+    rs = RunState(cfg)
+    if rs.daemon_running():
+        return json.loads(rs.state.read_text()).get("rpm"), "daemon"
+    tach = Tachometer(cfg)
+    if not tach.open():
+        return None, "unavailable"
+    try:
+        time.sleep(2)
+        return tach.read_rpm(), "measured"
+    finally:
+        tach.close()
+
+
+def cmd_speed(cfg: Config, as_json: bool) -> int:
+    rpm, source = current_rpm(cfg)
+    if as_json:
+        print(json.dumps({"rpm": rpm, "source": source}))
+    elif rpm is None:
+        print("current speed: n/a (no tachometer reading)")
+    else:
+        print(f"current speed: {rpm:.0f} rpm")
+    return 0 if rpm is not None else 1
+
+
+def cmd_stats(cfg: Config, hours: float, as_json: bool) -> int:
+    if hours <= 0:
+        raise ValueError("--hours must be positive")
+    hist = History(cfg, readonly=True)
+    try:
+        st = hist.stats(hours)
+    finally:
+        hist.close()
+    st["period_hours"] = hours
+    st["rpm_current"], _ = current_rpm(cfg)
+    if as_json:
+        print(json.dumps(st))
+        return 0
+
+    fmt = lambda v, f: "n/a" if v is None else f.format(v)
+    when = lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    period = f"{hours:g} h"
+    print(f"Fan speed, last {period}")
+    print(f"  current : {fmt(st['rpm_current'], '{:.0f} rpm')}")
+    print(f"  average : {fmt(st['rpm_avg'], '{:.0f} rpm')}")
+    print(f"  maximum : {fmt(st['rpm_max'], '{:.0f} rpm')}"
+          + (f"  (at {when(st['max_time'])})" if st["max_time"] else ""))
+    print(f"  minimum : {fmt(st['rpm_min'], '{:.0f} rpm')}")
+    print(f"  avg duty: {fmt(st['duty_avg'], '{:.0f} %')}")
+    print(f"  avg temp: {fmt(st['temp_avg'], '{:.1f} °C')}"
+          f"   (max {fmt(st['temp_max'], '{:.1f} °C')})")
+    if st["samples"]:
+        covered = st["covered_seconds"] / 3600
+        note = "" if covered >= hours * 0.95 else "  - history shorter than the period"
+        print(f"  data    : {st['samples']} samples since {when(st['first_sample'])}, "
+              f"{covered:.1f} h covered{note}")
+    else:
+        print(f"  data    : no samples in the last {period}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="noctua-fan",
+        description="Speed control and monitoring for a Noctua NF-A4x10 5V PWM fan "
+                    "on a Raspberry Pi 4.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  noctua-fan speed               current fan speed
+  noctua-fan stats               current / avg / max / min speed, last 24 hours
+  noctua-fan stats --hours 6     same, for the last 6 hours
+  noctua-fan stats --json        machine-readable output
+  noctua-fan set 60              run the fan at 60 %
+  noctua-fan auto                return to temperature control
+  noctua-fan help stats          options of one command""")
     ap.add_argument("-c", "--config", help=f"config file (default {DEFAULT_CONFIG_PATH})")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("set", help="set duty cycle 0-100")
-    p.add_argument("percent", type=float)
-    sub.add_parser("auto", help="clear manual override")
-    p = sub.add_parser("status", help="show temperature, duty and RPM")
-    p.add_argument("--json", action="store_true")
-    p = sub.add_parser("rpm", help="measure RPM")
-    p.add_argument("-s", "--seconds", type=float, default=3.0)
-    sub.add_parser("daemon", help="run the temperature control loop")
+    ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    sub = ap.add_subparsers(dest="cmd", title="commands", metavar="<command>")
+    p = sub.add_parser("speed", help="current fan speed (rpm)")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p = sub.add_parser("stats", help="current, average, max and min speed over a period")
+    p.add_argument("-H", "--hours", type=float, default=24.0,
+                   help="period to summarise, in hours (default 24)")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p = sub.add_parser("status", help="temperature, duty, rpm and control mode")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p = sub.add_parser("set", help="set duty cycle 0-100 (manual override)")
+    p.add_argument("percent", type=float, help="duty cycle in percent")
+    sub.add_parser("auto", help="clear manual override, follow the temperature curve")
+    p = sub.add_parser("rpm", help="measure rpm directly (daemon must be stopped)")
+    p.add_argument("-s", "--seconds", type=float, default=3.0,
+                   help="measurement window (default 3)")
+    sub.add_parser("daemon", help="run the temperature control loop (systemd)")
+    p = sub.add_parser("help", help="show these options, or a command's options")
+    p.add_argument("topic", nargs="?", help="command name")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
+    if args.cmd is None:
+        ap.print_help()
+        return 0
+    if args.cmd == "help":
+        if args.topic:
+            ap.parse_args([args.topic, "--help"])  # prints the command's options, exits
+        ap.print_help()
+        return 0
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
     try:
         cfg = Config.load(args.config)
+        if args.cmd == "speed":
+            return cmd_speed(cfg, args.json)
+        if args.cmd == "stats":
+            return cmd_stats(cfg, args.hours, args.json)
         if args.cmd == "set":
             return cmd_set(cfg, args.percent)
         if args.cmd == "auto":
@@ -445,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     except PermissionError as e:
         print(f"permission denied: {e.filename} (run with sudo or add your user "
               "to the 'gpio' group)", file=sys.stderr)
-    except (RuntimeError, ValueError, FileNotFoundError) as e:
+    except (RuntimeError, ValueError, FileNotFoundError, sqlite3.Error) as e:
         print(f"error: {e}", file=sys.stderr)
     return 1
 

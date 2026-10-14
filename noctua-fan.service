@@ -10,6 +10,8 @@ RestartSec=5
 RuntimeDirectory=noctua-fan
 RuntimeDirectoryMode=0775
 RuntimeDirectoryPreserve=yes
+StateDirectory=noctua-fan
+StateDirectoryMode=0755
 Group=gpio
 
 [Install]
