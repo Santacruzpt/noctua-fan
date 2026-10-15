@@ -40,11 +40,14 @@ Noctua's 4-pin connector → Pi 40-pin header (no extra components needed):
 
 ## Install (on the Pi)
 
+> 📖 **[docs/INSTALL.md](docs/INSTALL.md)** has the full step-by-step guide:
+> OS preparation, wiring, checks after each step, the HTTP API, the Open WebUI
+> tool, upgrading, uninstalling and troubleshooting. The summary is below.
+
 ```sh
-scp -r noctua-fan pi@raspberrypi:   # from your PC
-ssh pi@raspberrypi
-cd noctua-fan && sudo ./install.sh
-sudo reboot                         # only needed the first time (enables the PWM overlay)
+git clone https://github.com/Santacruzpt/noctua-fan.git
+cd noctua-fan && sudo ./install.sh          # add --api for the HTTP API / Open WebUI
+sudo reboot                                 # only needed the first time (enables the PWM overlay)
 ```
 
 `install.sh` does the following:
@@ -52,6 +55,8 @@ sudo reboot                         # only needed the first time (enables the PW
 - copies the app to `/usr/local/bin/noctua-fan` and the config to `/etc/noctua-fan.toml`
 - adds `dtoverlay=pwm,pin=18,func=2` to `/boot/firmware/config.txt`
 - enables the `noctua-fan` systemd service
+- with `--api`, it also enables the `noctua-fan-api` service and generates
+  an API token (see [Open WebUI](#open-webui))
 
 ## Usage
 
@@ -74,10 +79,10 @@ Example `stats` output:
 
 ```
 Fan speed, last 24 h
-  current : 1840 rpm
-  average : 1712 rpm
-  maximum : 3655 rpm  (at 2026-10-15 14:02)
-  minimum : 1190 rpm
+  current : 1840 rpm (37 % of 5000 rpm max)
+  average : 1712 rpm (34 % of 5000 rpm max)
+  maximum : 3655 rpm (73 % of 5000 rpm max)  at 2026-10-15 14:02
+  minimum : 1190 rpm (24 % of 5000 rpm max)
   avg duty: 31 %
   avg temp: 51.4 °C   (max 63.0 °C)
   data    : 1440 samples since 2026-10-14 15:30, 24.0 h covered
@@ -96,6 +101,11 @@ the SD card. Rows older than `history_days` (default 7) are deleted.
 - **maximum** is the highest 2-second reading.
 - **minimum** is the lowest 2-second reading. It is 0 if the fan was stopped.
 
+Every speed is also shown as a percentage of `max_rpm`, the fan's rated
+maximum (5000 rpm for the NF-A4x10 5V PWM). Fans have a ±10 % tolerance, so
+readings slightly above 100 % are normal. The JSON output and the API include
+the matching `*_pct` fields and `max_rpm`.
+
 If the service has run for less than the requested period, `stats` says so.
 
 Users in the `gpio` group (the default `pi` user is) can run these commands
@@ -112,20 +122,103 @@ Main settings:
   down. This stops the speed from hunting.
 - `min_duty`: the lowest non-zero duty. The NF-A4x10 is rated for about
   1200 rpm at 20 %.
-- `allow_stop`: whether a duty of 0 turns the fan off. Noctua fans built in
-  2019 or later stop at 0 %; older units keep spinning at minimum speed.
+- `allow_stop`: whether the curve's 0 % sends 0 % to the fan. Many current
+  Noctua PWM fans stop at 0 %, while others keep spinning at minimum speed.
+  Set it to `false` to hold `min_duty` instead.
 - `kickstart_*`: a short full-speed burst when the fan starts from a stop.
 - `exit_duty`: the duty left on the pin when the service stops. The default is
   100 % so the Pi stays safe.
+- `max_rpm`: the rated maximum speed that percentages are based on (default
+  5000). Set it to 0 to hide percentages.
 - `tach_gpio = -1`: turns RPM readout off if the green wire isn't connected.
   Speed statistics then show n/a, but duty and temperature are still recorded.
 - `history_interval` and `history_days`: the speed-history granularity and how
   long it is kept.
+- `api_bind`, `api_port` and `api_token_file`: settings for the HTTP API (see below).
+
+## HTTP API
+
+`noctua-fan serve` runs a small JSON API, by default on port 9102. Install it
+with `sudo ./install.sh --api`. The `noctua-fan-api` service runs as an
+unprivileged dynamic user in the `gpio` group, separate from the fan daemon.
+
+| Endpoint | Description |
+|---|---|
+| `GET /status` | temperature, duty, rpm and control mode |
+| `GET /speed` | current rpm |
+| `GET /stats?hours=24` | current, average, max and min rpm, plus average duty and temperature |
+| `POST /set` `{"percent": 60}` | manual duty override (**token required**) |
+| `POST /auto` | return to temperature control (**token required**) |
+
+```sh
+curl http://raspberrypi.local:9102/stats?hours=6
+curl -X POST -H "Authorization: Bearer $(sudo cat /etc/noctua-fan/api-token)" \
+     -d '{"percent": 60}' http://raspberrypi.local:9102/set
+```
+
+Read endpoints are open to anyone who can reach the port. Fan control is
+enabled only when `/etc/noctua-fan/api-token` exists; without it the API is
+read-only. To restrict the API to the Pi itself, set
+`api_bind = "127.0.0.1"`.
+
+## Open WebUI
+
+[`openwebui/noctua_fan_tool.py`](openwebui/noctua_fan_tool.py) is an
+[Open WebUI](https://openwebui.com) tool that talks to the HTTP API. With it,
+a model can answer questions like "how fast is the Pi fan spinning?" or "what
+was the max fan speed in the last 24 hours?", and can set the speed when you
+ask it to. A single tool can manage **several Raspberry Pis**.
+[docs/INSTALL.md, part 3](docs/INSTALL.md#part-3--open-webui-tool) has the
+full setup with checks and troubleshooting.
+
+1. On each Pi, run `sudo ./install.sh --api`.
+2. In Open WebUI, go to **Workspace → Tools → +**, paste the file's contents
+   and save.
+3. Open the tool's **Valves** and set the following:
+   - `pis`: one `name=address` entry per Pi, separated by commas. The address
+     is an IP or hostname, optionally with `:port` (default 9102), or a full
+     URL. For example:
+     ```
+     office=192.168.1.20, garage=192.168.1.31, attic=192.168.1.40:9200
+     ```
+     Use IP addresses. The Open WebUI container can't resolve `.local`
+     (mDNS) names, even when the host machine can.
+   - `api_tokens`: the token from `sudo cat /etc/noctua-fan/api-token` on each
+     Pi. Use one token for all Pis, or give each Pi its own:
+     ```
+     office=TOKEN1, garage=TOKEN2
+     ```
+     A bare token in the list (without `name=`) is used for any Pi that has
+     no entry of its own. Leave the field empty for read-only access.
+4. Enable the tool for a model or in a chat.
+
+How the names are used:
+- Questions that don't name a Pi ("how fast are my fans?") report on every
+  Pi, one section each. The Pis are queried in parallel, and one that can't
+  be reached doesn't block the others.
+- You can name a Pi loosely: "the garage pi", "Garage" and the address all
+  match `garage`. An unknown name gets a reply listing the configured Pis.
+- Changing the speed needs a Pi name, or "all". If several Pis are configured
+  and you don't say which, the model asks you instead of guessing.
+
+Answers give every speed both in rpm and as a percentage of the fan's
+maximum, for example "3660 rpm (73% of max)". The tool's output starts with an
+instruction to do so, because small models otherwise tend to drop the
+percentage.
+
+The tool provides four functions: `get_fan_status(pi)`,
+`get_fan_speed_stats(hours=24, pi)`, `set_fan_speed(percent, pi)` and
+`set_fan_automatic(pi)`. `pi` is optional.
+
+Open WebUI runs tools on its own server, so that server must be able to reach
+each Pi on port 9102. When you call the Open WebUI API (rather than using the
+browser), pass `"params": {"function_calling": "legacy"}` so the tools are
+actually executed.
 
 ## Development
 
 ```sh
-python3 -m unittest -v tests/test_noctua_fan.py
+python3 -m unittest discover -s tests
 ```
 
 The tests run on any Linux machine against a fake sysfs PWM/thermal tree.

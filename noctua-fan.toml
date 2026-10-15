@@ -10,6 +10,7 @@ pwm_frequency = 25000        # Hz; Noctua spec is 25 kHz
 tach_gpio = 24
 gpio_chip = 0
 pulses_per_rev = 2
+max_rpm = 5000               # rated max speed (NF-A4x10 5V PWM); speeds are also shown as % of this
 
 # --- Control loop -------------------------------------------------------------
 interval = 2.0               # seconds between temperature reads
@@ -26,6 +27,13 @@ thermal_zone = "/sys/class/thermal/thermal_zone0/temp"
 history_db = "/var/lib/noctua-fan/history.db"
 history_interval = 60.0      # seconds averaged into one stored sample
 history_days = 7.0           # how long samples are kept
+
+# --- HTTP API (`noctua-fan serve`, used by the Open WebUI tool) --------------
+api_bind = "0.0.0.0"         # "127.0.0.1" to allow local clients only
+api_port = 9102
+# Bearer token for POST /set and /auto. If the file is missing or empty the
+# API is read-only. install.sh generates one (readable by root and group gpio).
+api_token_file = "/etc/noctua-fan/api-token"
 
 # Fan curve: [CPU temperature °C, duty %], linearly interpolated.
 curve = [
