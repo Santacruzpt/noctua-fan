@@ -40,6 +40,10 @@ Noctua's 4-pin connector → Pi 40-pin header (no extra components needed):
 
 ## Install (on the Pi)
 
+> 📖 **[docs/INSTALL.md](docs/INSTALL.md)** has the full step-by-step guide:
+> OS preparation, wiring, checks after each step, the HTTP API, the Open WebUI
+> tool, upgrading, uninstalling and troubleshooting. The summary is below.
+
 ```sh
 git clone https://github.com/Santacruzpt/noctua-fan.git
 cd noctua-fan && sudo ./install.sh          # add --api for the HTTP API / Open WebUI
@@ -118,8 +122,9 @@ Main settings:
   down. This stops the speed from hunting.
 - `min_duty`: the lowest non-zero duty. The NF-A4x10 is rated for about
   1200 rpm at 20 %.
-- `allow_stop`: whether a duty of 0 turns the fan off. Noctua fans built in
-  2019 or later stop at 0 %; older units keep spinning at minimum speed.
+- `allow_stop`: whether the curve's 0 % sends 0 % to the fan. Many current
+  Noctua PWM fans stop at 0 %, while others keep spinning at minimum speed.
+  Set it to `false` to hold `min_duty` instead.
 - `kickstart_*`: a short full-speed burst when the fan starts from a stop.
 - `exit_duty`: the duty left on the pin when the service stops. The default is
   100 % so the Pi stays safe.
@@ -163,6 +168,8 @@ read-only. To restrict the API to the Pi itself, set
 a model can answer questions like "how fast is the Pi fan spinning?" or "what
 was the max fan speed in the last 24 hours?", and can set the speed when you
 ask it to. A single tool can manage **several Raspberry Pis**.
+[docs/INSTALL.md, part 3](docs/INSTALL.md#part-3--open-webui-tool) has the
+full setup with checks and troubleshooting.
 
 1. On each Pi, run `sudo ./install.sh --api`.
 2. In Open WebUI, go to **Workspace → Tools → +**, paste the file's contents
@@ -172,8 +179,10 @@ ask it to. A single tool can manage **several Raspberry Pis**.
      is an IP or hostname, optionally with `:port` (default 9102), or a full
      URL. For example:
      ```
-     office=192.168.1.20, garage=192.168.1.31, attic=attic-pi.local:9200
+     office=192.168.1.20, garage=192.168.1.31, attic=192.168.1.40:9200
      ```
+     Use IP addresses. The Open WebUI container can't resolve `.local`
+     (mDNS) names, even when the host machine can.
    - `api_tokens`: the token from `sudo cat /etc/noctua-fan/api-token` on each
      Pi. Use one token for all Pis, or give each Pi its own:
      ```

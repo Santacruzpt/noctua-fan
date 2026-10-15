@@ -358,8 +358,13 @@ class ToolConfigParsingTests(unittest.TestCase):
                          ("default-tok", "tok2"))
 
     def test_no_pis(self):
-        self.tool.valves.pis = ""
+        self.assertEqual(self.tool.valves.pis, "")              # default: nothing configured
         self.assertIn("No Raspberry Pis are configured", self.tool.get_fan_status())
+
+    def test_local_name_hint(self):
+        self.tool.valves.pis = "pi=no-such-host-for-test.local"
+        self.tool.valves.timeout = 3
+        self.assertIn("use the Pi's IP address", self.tool.get_fan_status())
 
 
 if __name__ == "__main__":

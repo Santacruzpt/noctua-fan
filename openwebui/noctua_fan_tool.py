@@ -57,10 +57,11 @@ def _to_url(target):
 class Tools:
     class Valves(BaseModel):
         pis: str = Field(
-            default="raspberrypi=raspberrypi.local",
+            default="",
             description="Raspberry Pis running `noctua-fan serve`, as comma-separated "
             "name=address entries. Address is an IP or hostname, optionally with :port "
-            "(default 9102), or a full URL. "
+            "(default 9102), or a full URL. Use IP addresses: '.local' names usually "
+            "don't resolve inside the Open WebUI container. "
             "Example: office=192.168.1.20, garage=192.168.1.31:9102",
         )
         api_tokens: str = Field(
@@ -144,7 +145,11 @@ class Tools:
             raise RuntimeError(f"fan API error {e.code}: {msg}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             reason = getattr(e, "reason", e)
-            raise RuntimeError(f"cannot reach the fan API at {url}: {reason}") from None
+            hint = ""
+            if ".local" in url and "name" in str(reason).lower():
+                hint = (" ('.local' names need mDNS, which the Open WebUI container usually "
+                        "lacks; use the Pi's IP address in the tool's 'pis' valve)")
+            raise RuntimeError(f"cannot reach the fan API at {url}: {reason}{hint}") from None
 
     def _each(self, targets, fn):
         """Run fn(name, url) for every target in parallel; one text block per Pi."""
