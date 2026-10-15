@@ -162,28 +162,47 @@ read-only. To restrict the API to the Pi itself, set
 [Open WebUI](https://openwebui.com) tool that talks to the HTTP API. With it,
 a model can answer questions like "how fast is the Pi fan spinning?" or "what
 was the max fan speed in the last 24 hours?", and can set the speed when you
-ask it to.
+ask it to. A single tool can manage **several Raspberry Pis**.
 
-1. On the Pi, run `sudo ./install.sh --api`.
+1. On each Pi, run `sudo ./install.sh --api`.
 2. In Open WebUI, go to **Workspace → Tools → +**, paste the file's contents
    and save.
 3. Open the tool's **Valves** and set the following:
-   - `api_url`: `http://<pi-hostname-or-ip>:9102`
-   - `api_token`: the output of `sudo cat /etc/noctua-fan/api-token` on the
-     Pi. Leave it empty for read-only.
+   - `pis`: one `name=address` entry per Pi, separated by commas. The address
+     is an IP or hostname, optionally with `:port` (default 9102), or a full
+     URL. For example:
+     ```
+     office=192.168.1.20, garage=192.168.1.31, attic=attic-pi.local:9200
+     ```
+   - `api_tokens`: the token from `sudo cat /etc/noctua-fan/api-token` on each
+     Pi. Use one token for all Pis, or give each Pi its own:
+     ```
+     office=TOKEN1, garage=TOKEN2
+     ```
+     A bare token in the list (without `name=`) is used for any Pi that has
+     no entry of its own. Leave the field empty for read-only access.
 4. Enable the tool for a model or in a chat.
+
+How the names are used:
+- Questions that don't name a Pi ("how fast are my fans?") report on every
+  Pi, one section each. The Pis are queried in parallel, and one that can't
+  be reached doesn't block the others.
+- You can name a Pi loosely: "the garage pi", "Garage" and the address all
+  match `garage`. An unknown name gets a reply listing the configured Pis.
+- Changing the speed needs a Pi name, or "all". If several Pis are configured
+  and you don't say which, the model asks you instead of guessing.
 
 Answers give every speed both in rpm and as a percentage of the fan's
 maximum, for example "3660 rpm (73% of max)". The tool's output starts with an
 instruction to do so, because small models otherwise tend to drop the
 percentage.
 
-The tool provides four functions: `get_fan_status`,
-`get_fan_speed_stats(hours=24)`, `set_fan_speed(percent)` and
-`set_fan_automatic`.
+The tool provides four functions: `get_fan_status(pi)`,
+`get_fan_speed_stats(hours=24, pi)`, `set_fan_speed(percent, pi)` and
+`set_fan_automatic(pi)`. `pi` is optional.
 
 Open WebUI runs tools on its own server, so that server must be able to reach
-the Pi on port 9102. When you call the Open WebUI API (rather than using the
+each Pi on port 9102. When you call the Open WebUI API (rather than using the
 browser), pass `"params": {"function_calling": "legacy"}` so the tools are
 actually executed.
 

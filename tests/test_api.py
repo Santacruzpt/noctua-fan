@@ -196,18 +196,22 @@ class DaemonRunningTests(unittest.TestCase):
 
 
 class OpenWebUIToolTests(APITestBase):
+    """One Pi configured."""
+
     def setUp(self):
         super().setUp()
         self.tool = load_tool().Tools()
-        self.tool.valves.api_url = self.url
-        self.tool.valves.api_token = self.token
+        self.tool.valves.pis = f"pi1={self.url}"
+        self.tool.valves.api_tokens = self.token
 
     def test_status(self):
         self.fake_daemon()
         out = self.tool.get_fan_status()
+        self.assertTrue(out.startswith("IMPORTANT:"))
         self.assertIn("speed: 1850 rpm = 37% of max speed", out)
         self.assertIn("CPU temperature: 52.0 °C", out)
         self.assertIn("control mode: auto", out)
+        self.assertNotIn("###", out)                        # single Pi: no per-Pi headings
 
     def test_stats(self):
         self.fill_history()
@@ -216,26 +220,146 @@ class OpenWebUIToolTests(APITestBase):
         self.assertIn("highest: 3600 rpm = 72% of max speed", out)
         self.assertIn("lowest: 900 rpm = 18% of max speed", out)
         self.assertTrue(out.startswith("IMPORTANT:"))
-        self.assertIn("5000 rpm maximum", out)
         self.assertIn("last 24 hours", out)
         self.assertIn("1200 rpm", self.tool.get_fan_speed_stats(hours=5))
 
     def test_set_and_auto(self):
         rs = self.fake_daemon()
-        self.assertIn("Fan set to 45 %", self.tool.set_fan_speed(45))
+        self.assertIn("Fan on 'pi1' set to 45 %", self.tool.set_fan_speed(45))  # pi optional
         self.assertEqual(rs.read_override(), 45)
-        self.assertIn("cleared", self.tool.set_fan_automatic())
+        self.assertIn("Done: the fan on 'pi1' was switched", self.tool.set_fan_automatic())
+        self.assertIn("No change", self.tool.set_fan_automatic())
         self.assertIn("between 0 and 100", self.tool.set_fan_speed(120))
 
     def test_no_token_and_wrong_token(self):
-        self.tool.valves.api_token = ""
+        self.tool.valves.api_tokens = ""
         self.assertIn("disabled", self.tool.set_fan_speed(50))
-        self.tool.valves.api_token = "wrong"
+        self.tool.valves.api_tokens = "wrong"
         self.assertIn("401", self.tool.set_fan_speed(50))
 
     def test_unreachable(self):
-        self.tool.valves.api_url = "http://127.0.0.1:1"
+        self.tool.valves.pis = "pi1=127.0.0.1:1"
         self.assertIn("cannot reach the fan API", self.tool.get_fan_status())
+
+
+class MultiPiToolTests(APITestBase):
+    """Two Pis: 'office' (this test's server) and 'garage' (a second server)."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmpdir2 = tempfile.TemporaryDirectory()
+        tmp2 = Path(self.tmpdir2.name)
+        self.cfg2 = make_cfg(tmp2, api_bind="127.0.0.1", api_port=0,
+                             api_token_file=str(tmp2 / "token"), max_rpm=4000)
+        (tmp2 / "token").write_text("garage-token\n")
+        self.server2 = nf.make_server(self.cfg2)
+        threading.Thread(target=self.server2.serve_forever, daemon=True).start()
+        port2 = self.server2.server_address[1]
+
+        rs2 = nf.RunState(self.cfg2)
+        rs2.dir.mkdir(parents=True)
+        rs2.write_state(pid=nf.os.getpid(), time=time.time(), temp=61.0,
+                        duty=60.0, rpm=3000.0, mode="auto")
+        self.rs1 = self.fake_daemon()                        # office: 1850 rpm
+        self.rs2 = rs2
+
+        self.tool = load_tool().Tools()
+        port1 = self.server.server_address[1]
+        self.tool.valves.pis = f"office=127.0.0.1:{port1}, garage=http://127.0.0.1:{port2}"
+        self.tool.valves.api_tokens = f"office={self.token}, garage=garage-token"
+
+    def tearDown(self):
+        self.server2.shutdown()
+        self.server2.server_close()
+        self.tmpdir2.cleanup()
+        super().tearDown()
+
+    def test_status_all_pis(self):
+        out = self.tool.get_fan_status()
+        self.assertIn("### Raspberry Pi 'office'", out)
+        self.assertIn("### Raspberry Pi 'garage'", out)
+        self.assertIn("1850 rpm = 37% of max speed", out)
+        self.assertIn("3000 rpm = 75% of max speed", out)     # garage max_rpm = 4000
+        self.assertLess(out.index("'office'"), out.index("'garage'"))
+
+    def test_status_one_pi(self):
+        for name in ("garage", "GARAGE", "the garage pi", "Garage Pi"):
+            out = self.tool.get_fan_status(pi=name)
+            self.assertIn("3000 rpm", out, name)
+            self.assertNotIn("1850 rpm", out, name)
+
+    def test_select_by_address(self):
+        port2 = self.server2.server_address[1]
+        self.assertIn("3000 rpm", self.tool.get_fan_status(pi=f"127.0.0.1:{port2}"))
+
+    def test_unknown_pi(self):
+        out = self.tool.get_fan_status(pi="kitchen")
+        self.assertIn("Unknown Raspberry Pi 'kitchen'", out)
+        self.assertIn("office, garage", out)
+
+    def test_stats_all_pis_with_one_missing_history(self):
+        self.fill_history()                                  # office only
+        out = self.tool.get_fan_speed_stats(hours=24)
+        self.assertIn("average: 2000 rpm", out)
+        self.assertIn("no speed history yet", out)           # garage: 503 from its API
+
+    def test_set_requires_pi_when_several(self):
+        out = self.tool.set_fan_speed(50)
+        self.assertIn("say which one", out)
+        self.assertIsNone(self.rs1.read_override())
+        self.assertIsNone(self.rs2.read_override())
+
+    def test_set_one_and_all_with_per_pi_tokens(self):
+        self.assertIn("'garage' set to 50 %", self.tool.set_fan_speed(50, pi="garage"))
+        self.assertEqual((self.rs1.read_override(), self.rs2.read_override()), (None, 50))
+        out = self.tool.set_fan_speed(80, pi="all")
+        self.assertIn("'office' set to 80 %", out)
+        self.assertIn("'garage' set to 80 %", out)
+        self.assertEqual((self.rs1.read_override(), self.rs2.read_override()), (80, 80))
+        self.tool.set_fan_automatic(pi="all")
+        self.assertEqual((self.rs1.read_override(), self.rs2.read_override()), (None, None))
+
+    def test_token_for_one_pi_only(self):
+        self.tool.valves.api_tokens = "garage=garage-token"
+        out = self.tool.set_fan_speed(30, pi="all")
+        self.assertIn("'office' is disabled", out)
+        self.assertIn("'garage' set to 30 %", out)
+
+
+class ToolConfigParsingTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_tool()
+        self.tool = self.mod.Tools()
+
+    def test_to_url(self):
+        u = self.mod._to_url
+        self.assertEqual(u("192.168.1.20"), "http://192.168.1.20:9102")
+        self.assertEqual(u("pi.local:8000"), "http://pi.local:8000")
+        self.assertEqual(u("https://pi.example/"), "https://pi.example")
+        self.assertEqual(u("fe80::1"), "http://[fe80::1]:9102")
+        self.assertEqual(u("[fe80::1]:9000"), "http://[fe80::1]:9000")
+
+    def test_pis_parsing(self):
+        self.tool.valves.pis = "office = 192.168.1.20 ;\n garage=192.168.1.31:9200, 10.0.0.5"
+        self.assertEqual(self.tool._pis(), {
+            "office": "http://192.168.1.20:9102",
+            "garage": "http://192.168.1.31:9200",
+            "10.0.0.5": "http://10.0.0.5:9102",
+        })
+
+    def test_tokens(self):
+        self.tool.valves.pis = "office=1.2.3.4, garage=1.2.3.5"
+        self.tool.valves.api_tokens = "shared-tok"
+        self.assertEqual(self.tool._token("garage"), "shared-tok")
+        self.tool.valves.api_tokens = "office=tok1, garage=tok2"
+        self.assertEqual((self.tool._token("office"), self.tool._token("Garage")), ("tok1", "tok2"))
+        self.tool.valves.api_tokens = "default-tok, garage=tok2"
+        self.assertEqual((self.tool._token("office"), self.tool._token("garage")),
+                         ("default-tok", "tok2"))
+
+    def test_no_pis(self):
+        self.tool.valves.pis = ""
+        self.assertIn("No Raspberry Pis are configured", self.tool.get_fan_status())
 
 
 if __name__ == "__main__":
